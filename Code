@@ -1,0 +1,785 @@
+#pragma config FEXTOSC = OFF    
+#pragma config RSTOSC = HFINTOSC_64MHZ 
+#pragma config CLKOUTEN = OFF   
+#pragma config PR1WAY = ON      
+#pragma config CSWEN = ON       
+#pragma config FCMEN = OFF      
+#pragma config MCLRE = EXTMCLR  
+#pragma config PWRTS = PWRT_OFF 
+#pragma config MVECEN = OFF     
+#pragma config IVT1WAY = ON     
+#pragma config LPBOREN = OFF    
+#pragma config BOREN = OFF      
+#pragma config BORV = VBOR_2P45 
+#pragma config ZCD = OFF        
+#pragma config PPS1WAY = OFF
+#pragma config STVREN = OFF     
+#pragma config DEBUG = OFF      
+#pragma config XINST = OFF      
+#pragma config WDTCPS = WDTCPS_31
+#pragma config WDTE = OFF       
+#pragma config WDTCWS = WDTCWS_7
+#pragma config WDTCCS = SC      
+#pragma config BBSIZE = BBSIZE_512
+#pragma config BBEN = OFF       
+#pragma config SAFEN = OFF    
+#pragma config WRTAPP = OFF     
+#pragma config WRTB = OFF       
+#pragma config WRTC = OFF       
+#pragma config LVP = OFF         
+#pragma config CP = OFF         
+
+#define _XTAL_FREQ 64000000 
+#include <xc.h>
+#include <stdint.h>
+
+// ULTRASONIC PINS
+#define TRIG_PIN LATAbits.LATA0
+#define ECHO_PIN PORTAbits.RA1
+
+// ==========================================
+// GY-31 & SERVO PINS
+// ==========================================
+#define S0 LATAbits.LATA3
+#define S1 LATAbits.LATA2
+#define S2 LATEbits.LATE0
+#define S3 LATAbits.LATA5
+#define LED_PIN LATAbits.LATA4
+#define OUT_PIN PORTEbits.RE1
+#define SERVO_PIN LATEbits.LATE2
+
+// TUNING PARAMETERS 
+float Kp = 30.0;
+float Ki = 0.0;   
+float Kd = 200.0; 
+
+int base_speed = 125;  
+int pivot_speed = 190;
+
+// GLOBAL STATE 
+int error = 0, previous_error = 0;
+float P = 0, I = 0, D = 0, PID_value = 0;
+int left_dir = 0, right_dir = 0, lost_line_flag = 0; 
+int junction_count = 0, in_junction = 0;
+
+// ==========================================
+// UTILITY FUNCTIONS 
+// ==========================================
+void exact_delay_ms(uint16_t ms) {
+    for (uint16_t i = 0; i < ms; i++) __delay_ms(1);
+}
+
+void unlock_pps() {
+    GIE = 0; PPSLOCK = 0x55; PPSLOCK = 0xAA; PPSLOCKED = 0;
+}
+
+void lock_pps() {
+    PPSLOCK = 0x55; PPSLOCK = 0xAA; PPSLOCKED = 1; GIE = 1;
+}
+
+// ==========================================
+// ULTRASONIC DISTANCE FUNCTION
+// ==========================================
+float get_distance_cm(void) {
+    unsigned int time_us = 0;
+    
+    // Failsafe: clear stuck ECHO pin from a previous crash
+    if (ECHO_PIN == 1) {
+        TRIG_PIN = 0;
+        exact_delay_ms(5); 
+    }
+    
+    TRIG_PIN = 1;
+    __delay_us(10);
+    TRIG_PIN = 0;
+    
+    unsigned int timeout = 10000;
+    while(ECHO_PIN == 0 && timeout > 0) timeout--;
+    if(timeout == 0) return 999.0; 
+    
+    timeout = 30000; 
+    while(ECHO_PIN == 1 && timeout > 0) {
+        __delay_us(2);
+        time_us += 2;
+        timeout--;
+    }
+    
+    return ((float)time_us * 0.01715);
+}
+
+// ==========================================
+// MOTOR & HARDWARE CONTROL (MX1508 Logic)
+// ==========================================
+void set_motor_speeds(int left_speed, int right_speed) {
+    if (left_speed >= 0) {
+        if (left_dir != 1) { 
+            PWM8DCH = 0;
+            exact_delay_ms(5); 
+            unlock_pps(); RD1PPS = 0x00; RD3PPS = 0x00; RD0PPS = 0x10; RD2PPS = 0x10; lock_pps();
+            left_dir = 1;
+        }
+    } else {
+        if (left_dir != -1) { 
+            PWM8DCH = 0;
+            exact_delay_ms(5); 
+            unlock_pps(); RD0PPS = 0x00; RD2PPS = 0x00; RD1PPS = 0x10; RD3PPS = 0x10; lock_pps();
+            left_dir = -1;
+        }
+        left_speed = -left_speed;
+    }
+    if (right_speed >= 0) {
+        if (right_dir != 1) { 
+            PWM6DCH = 0;
+            exact_delay_ms(5); 
+            unlock_pps(); RD5PPS = 0x00; RD6PPS = 0x00; RD4PPS = 0x0E; RD7PPS = 0x0E; lock_pps();
+            right_dir = 1;
+        }
+    } else {
+        if (right_dir != -1) { 
+            PWM6DCH = 0;
+            exact_delay_ms(5); 
+            unlock_pps(); RD4PPS = 0x00; RD7PPS = 0x00; RD5PPS = 0x0E; RD6PPS = 0x0E; lock_pps();
+            right_dir = -1;
+        }
+        right_speed = -right_speed;
+    }
+    if (left_speed > 255) left_speed = 255;
+    if (right_speed > 255) right_speed = 255;
+    PWM8DCH = (unsigned char)left_speed;
+    PWM6DCH = (unsigned char)right_speed;
+}
+
+void pwm_initialize(void) {
+    CCPTMRS1 = 0x55; T2CLKCON = 0x01;
+    T2PR = 255; T2CON = 0b11000000;
+    PWM8CON = 0b10000000; PWM6CON = 0b10000000;
+    set_motor_speeds(0, 0);
+}
+
+void sensor_initialize(void) {
+    ANSELB &= 0xE0; TRISB |= 0x1F;
+    ANSELA &= 0xFC; 
+    TRISA &= 0xFE;
+    TRISA |= 0x02;  
+    LATA &= 0xFE;   
+
+    // --- Added Initialization for GY-31 and Servo ---
+    // Clear analog flags for E
+    ANSELE &= 0xF8; 
+    
+    // Set S0, S1, LED, S3 as Output
+    TRISAbits.TRISA2 = 0; // S1
+    TRISAbits.TRISA3 = 0; // S0
+    TRISAbits.TRISA4 = 0; // LED
+    TRISAbits.TRISA5 = 0; // S3
+    
+    // Set S2 and SERVO as Output, OUT as Input
+    TRISEbits.TRISE0 = 0; // S2
+    TRISEbits.TRISE1 = 1; // OUT (Input)
+    TRISEbits.TRISE2 = 0; // SERVO
+    
+    // Turn on White LEDs
+    LED_PIN = 1; 
+    
+    // Set Frequency Scaling to 20% (S0=HIGH, S1=LOW)
+    S0 = 1;
+    S1 = 0;
+}
+
+// ==========================================
+// SEPARATE MODULE: COLOR SENSOR & SERVO
+// ==========================================
+
+// Custom microsecond delay needed for variable variables
+void custom_delay_us(uint16_t us) {
+    while(us--) {
+        __delay_us(1);
+    }
+}
+
+// Replicates Arduino's pulseIn(pin, LOW)
+uint16_t get_color_pulse(void) {
+    uint16_t timeout = 10000;
+    uint16_t time_us = 0;
+    
+    // Wait for the pin to go HIGH then LOW
+    while(OUT_PIN == 1 && timeout > 0) timeout--;
+    if (timeout == 0) return 9999;
+    
+    timeout = 10000;
+    // Measure how long it stays LOW
+    while(OUT_PIN == 0 && timeout > 0) {
+        __delay_us(1);
+        time_us++;
+        timeout--;
+    }
+    return time_us;
+}
+
+// Drives the servo to a specific angle (0 to 180)
+void drive_servo_angle(int angle) {
+    // Convert angle to microseconds (1000us to 2000us)
+    int pulse_us = 1000 + (angle * 1000) / 180;
+    
+    // Send 10 pulses to give the servo time to physically move
+    for(int i = 0; i < 10; i++) {
+        SERVO_PIN = 1;
+        custom_delay_us(pulse_us);
+        SERVO_PIN = 0;
+        exact_delay_ms(20); // 50Hz frequency
+    }
+}
+
+// The main routine to check color and trigger the sweep
+void process_color_sensor(void) {
+    int redValue, greenValue, blueValue;
+    const int THRESHOLD = 900;
+
+    // Read Red
+    S2 = 0; S3 = 0;
+    redValue = get_color_pulse();
+    
+    // Read Green
+    S2 = 1; S3 = 1;
+    greenValue = get_color_pulse();
+    
+    // Read Blue
+    S2 = 0; S3 = 1;
+    blueValue = get_color_pulse();
+
+    // Check if BLUE is dominant and below the threshold
+    if (blueValue < redValue && blueValue < greenValue && blueValue <= THRESHOLD) {
+        // "Starts rotating in all directions" -> Sweep routine
+        drive_servo_angle(0);
+        drive_servo_angle(90);
+        drive_servo_angle(180);
+        drive_servo_angle(90); // Return to neutral
+    }
+}
+// ==========================================
+
+
+// ==========================================
+// MAIN EXECUTION
+// ==========================================
+void main(void) {
+    OSCFRQ = 0x08; // 64MHz
+    ANSELD = 0x00; TRISD = 0x00; LATD = 0x00;
+    
+    pwm_initialize();
+    sensor_initialize();
+    
+    // Neutralize servo on startup
+    drive_servo_angle(90); 
+    
+    exact_delay_ms(1000);
+
+    while(1) {
+        // ---- COLOR SENSOR MODULE CALL ----
+        process_color_sensor(); 
+        // ----------------------------------
+
+        // Read Sensors (1 = Black, 0 = White)
+        int s1 = (RB0 == 1) ? 1 : 0; // Left-most
+        int s2 = (RB1 == 1) ? 1 : 0; 
+        int s3 = (RB2 == 1) ? 1 : 0; // Middle
+        int s4 = (RB3 == 1) ? 1 : 0; 
+        int s5 = (RB4 == 1) ? 1 : 0; // Right-most
+
+        // ==========================================
+        // SENSOR-LOCKED JUNCTION GATEKEEPER
+        // ==========================================
+        int trigger_detected = 0;
+        int next_j = junction_count + 1;
+
+        // Target: Left Turns (new track 3, 7, 8, 13)
+        if (next_j == 3 || next_j == 7 || next_j == 8 || next_j == 13) {
+            if (s1 == 1 && s2 == 1 && s3 == 1) trigger_detected = 1;
+        } 
+        // Target: Right Turns (new track 14, and S3 J2 which is now 16)
+        else if (next_j == 14 || next_j == 16) {
+            if (s3 == 1 && s4 == 1 && s5 == 1) trigger_detected = 1;
+        }
+        // Target: J17 (left 3 turn on)
+        else if (next_j == 17) {
+            if (s1 == 1 && s2 == 1 && s3 == 1) trigger_detected = 1;
+        }
+        // Target: J18 & J19 (left most and middle turn on)
+        else if (next_j == 18 || next_j == 19) {
+            if (s1 == 1 && s3 == 1) trigger_detected = 1;
+        }
+        // Target: J20 (drift trigger: middle three turn on)
+        else if (next_j == 20) {
+            if (s2 == 1 && s3 == 1 && s4 == 1) trigger_detected = 1;
+        }
+        // Target: All See Black (Generic / straight crosses / stops)
+        else {
+            if (s1 == 1 && s2 == 1 && s3 == 1 && s4 == 1 && s5 == 1) trigger_detected = 1;
+        }
+
+        // ==========================================
+        // Latch Increment & Execution Logic
+        // ==========================================
+        if (trigger_detected == 1 && in_junction == 0) {
+            junction_count++;
+            in_junction = 1; 
+
+            // JUNCTIONS 3, 7: Simple Left Turns
+            if (junction_count == 3 || junction_count == 7) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(160);
+                
+                set_motor_speeds(-pivot_speed, pivot_speed);
+                exact_delay_ms(280); 
+                while(RB2 == 1);     
+                while(RB2 == 0);     
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue; 
+            }
+            
+            // JUNCTION 8: Left Turn -> Ultrasonic -> 180 U-Turn
+            else if (junction_count == 8) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(160); 
+                
+                set_motor_speeds(-pivot_speed, pivot_speed); // Left Turn
+                exact_delay_ms(280);
+                while(RB2 == 1); 
+                while(RB2 == 0); 
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50); 
+                previous_error = 0; I = 0;
+
+                int stop_confidence = 0;
+                int sensor_cooldown = 25; 
+                int time_elapsed_ms = 0; // FAILSAFE TIMER
+                float dist = 999.0;        
+
+                while(1) {
+                    sensor_cooldown++;
+                    time_elapsed_ms += 2; // Add 2ms per loop for PID delay
+                    
+                    if (sensor_cooldown > 25) {
+                        dist = get_distance_cm();
+                        sensor_cooldown = 0;
+                        time_elapsed_ms += 10; // Approx time sensor ping takes
+                    }
+
+                    // TIMEOUT FAILSAFE: 550ms Limit
+                    if (time_elapsed_ms >= 550) {
+                        set_motor_speeds(0, 0);
+                        exact_delay_ms(1500);
+                        break;
+                    }
+
+                    // SENSING RANGE: 6.0cm
+                    if (dist > 1.0 && dist < 100.0) {
+                        if (dist <= 6.0) stop_confidence++;
+                        else if (dist > 6.5) stop_confidence = 0; 
+                    }
+                    
+                    if (stop_confidence >= 2) {
+                        set_motor_speeds(0, 0);
+                        exact_delay_ms(1500); 
+                        break; 
+                    }
+                    
+                    int app_s1 = (RB0 == 1) ? 1 : 0; int app_s2 = (RB1 == 1) ? 1 : 0; 
+                    int app_s3 = (RB2 == 1) ? 1 : 0; int app_s4 = (RB3 == 1) ? 1 : 0; 
+                    int app_s5 = (RB4 == 1) ? 1 : 0;
+                    
+                    int app_err = 0;
+                    if      ( app_s1 && !app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -10;
+                    else if ( app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -6;
+                    else if (!app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -3;
+                    else if (!app_s1 &&  app_s2 &&  app_s3 && !app_s4 && !app_s5) app_err = -1;
+                    else if (!app_s1 && !app_s2 &&  app_s3 &&  app_s4 && !app_s5) app_err =  0;
+                    else if (!app_s1 && !app_s2 &&  app_s3 &&  app_s4 && !app_s5) app_err =  1;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 && !app_s5) app_err =  3;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 &&  app_s5) app_err =  6;
+                    else if (!app_s1 && !app_s2 && !app_s3 && !app_s4 &&  app_s5) app_err =  10; 
+                    
+                    float app_P = app_err; I += app_err; float app_D = app_err - previous_error;
+                    if (I > 50) I = 50; if (I < -50) I = -50;
+                    float app_PID = (Kp * app_P) + (Ki * I) + (Kd * app_D);
+                    previous_error = app_err;
+
+                    set_motor_speeds(base_speed + (int)app_PID, base_speed - (int)app_PID);
+                    exact_delay_ms(2);
+                }
+                
+                // Perfect 180 U-Turn
+                set_motor_speeds(pivot_speed, -pivot_speed);
+                exact_delay_ms(450); 
+                while(RB2 == 1);     
+                while(RB2 == 0);     
+                
+                set_motor_speeds(-pivot_speed, pivot_speed);
+                exact_delay_ms(50);
+                
+                set_motor_speeds(0, 0);
+                exact_delay_ms(100); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // JUNCTION 10: Right Turn
+            else if (junction_count == 10) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(160); 
+                
+                set_motor_speeds(pivot_speed, -pivot_speed); 
+                exact_delay_ms(280);
+                while(RB2 == 1); 
+                while(RB2 == 0); 
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // JUNCTION 11 & 12: Simple Line Follow
+            else if (junction_count == 11 || junction_count == 12) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(150);
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // JUNCTION 13: Left Turn -> Ultrasonic -> 180 U-Turn
+            else if (junction_count == 13) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(160); 
+                
+                set_motor_speeds(-pivot_speed, pivot_speed); 
+                exact_delay_ms(280);
+                while(RB2 == 1); 
+                while(RB2 == 0); 
+                set_motor_speeds(0, 0); 
+                exact_delay_ms(50);
+                previous_error = 0; I = 0;
+
+                int stop_confidence = 0;
+                int sensor_cooldown = 25; 
+                int time_elapsed_ms = 0; // FAILSAFE TIMER
+                float dist = 999.0;        
+
+                while(1) {
+                    sensor_cooldown++;
+                    time_elapsed_ms += 2;
+                    
+                    if (sensor_cooldown > 25) {
+                        dist = get_distance_cm();
+                        sensor_cooldown = 0;
+                        time_elapsed_ms += 10;
+                    }
+
+                    // TIMEOUT FAILSAFE: 550ms Limit
+                    if (time_elapsed_ms >= 550) {
+                        set_motor_speeds(0, 0);
+                        exact_delay_ms(1500);
+                        break;
+                    }
+
+                    // SENSING RANGE: 6.0cm
+                    if (dist > 1.0 && dist < 100.0) {
+                        if (dist <= 6.0) stop_confidence++;
+                        else if (dist > 6.5) stop_confidence = 0; 
+                    }
+                    
+                    if (stop_confidence >= 2) {
+                        set_motor_speeds(0, 0);
+                        exact_delay_ms(1500); 
+                        break; 
+                    }
+                    
+                    int app_s1 = (RB0 == 1) ? 1 : 0; int app_s2 = (RB1 == 1) ? 1 : 0; 
+                    int app_s3 = (RB2 == 1) ? 1 : 0; int app_s4 = (RB3 == 1) ? 1 : 0; 
+                    int app_s5 = (RB4 == 1) ? 1 : 0;
+                    
+                    int app_err = 0;
+                    if      ( app_s1 && !app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -10;
+                    else if ( app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -6;
+                    else if (!app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -3;
+                    else if (!app_s1 &&  app_s2 &&  app_s3 && !app_s4 && !app_s5) app_err = -1;
+                    else if (!app_s1 && !app_s2 &&  app_s3 &&  app_s4 && !app_s5) app_err =  0;
+                    else if (!app_s1 && !app_s2 &&  app_s3 &&  app_s4 && !app_s5) app_err =  1;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 && !app_s5) app_err =  3;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 &&  app_s5) app_err =  6;
+                    else if (!app_s1 && !app_s2 && !app_s3 && !app_s4 &&  app_s5) app_err =  10; 
+                    
+                    float app_P = app_err; I += app_err; float app_D = app_err - previous_error;
+                    if (I > 50) I = 50; if (I < -50) I = -50;
+                    float app_PID = (Kp * app_P) + (Ki * I) + (Kd * app_D);
+                    previous_error = app_err;
+
+                    set_motor_speeds(base_speed + (int)app_PID, base_speed - (int)app_PID);
+                    exact_delay_ms(2);
+                }
+                
+                set_motor_speeds(pivot_speed, -pivot_speed);
+                exact_delay_ms(450); 
+                while(RB2 == 1);     
+                while(RB2 == 0);     
+                
+                set_motor_speeds(-pivot_speed, pivot_speed);
+                exact_delay_ms(50);
+                
+                set_motor_speeds(0, 0);
+                exact_delay_ms(100);
+                previous_error = 0; I = 0; in_junction = 0;
+                continue;
+            }
+
+            // JUNCTION 14: Right Turn
+            else if (junction_count == 14 ) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(160); 
+                
+                set_motor_speeds(pivot_speed, -pivot_speed); 
+                exact_delay_ms(280);
+                while(RB2 == 1); 
+                while(RB2 == 0); 
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // JUNCTION 15: Merge Point
+            else if (junction_count == 15) {
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(150); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // JUNCTION 16: Right Turn with Boost
+            else if (junction_count == 16) {
+                set_motor_speeds(220, -200);
+                exact_delay_ms(300);
+                while(RB2 ==1);
+                while(RB2 == 0);
+                
+                base_speed = 165; 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue; 
+            }
+
+            // JUNCTION 17: Straight
+            else if (junction_count == 17) {  
+                base_speed= 165;
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(150); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+            
+            // JUNCTION 18 & 19: Stabilization Zone
+            else if (junction_count == 18 || junction_count == 19) {  
+                base_speed = 165;
+                set_motor_speeds(base_speed, base_speed);
+                exact_delay_ms(150); 
+                previous_error = 0; I = 0; in_junction = 0; 
+                continue;
+            }
+
+            // =========================================================
+            // JUNCTION 20: The Reverse Slingshot
+            // =========================================================
+            else if (junction_count == 20) {  
+                // 1. ALIGNMENT (Point nose to ramp)
+                set_motor_speeds(-200, 220); 
+                exact_delay_ms(180); 
+                
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50);
+                
+                // 2. THE RUN-UP: Reverse straight backwards blindly
+                set_motor_speeds(-200, -200); 
+                exact_delay_ms(450); 
+                
+                // 3. SETTLE
+                set_motor_speeds(0, 0);
+                exact_delay_ms(50);
+                
+                // 4. THE LAUNCH: Maximum power forward
+                set_motor_speeds(255, 255);
+                exact_delay_ms(1300); 
+                
+                previous_error = 0; I = 0; in_junction = 0;  
+                continue;
+            }
+
+          
+            // ==========================================
+            // JUNCTION 21: Park Sequence
+            // ==========================================
+            else if (junction_count == 21) {
+                // 1. FIRM STOP AT J21 
+                set_motor_speeds(-150, -150); 
+                exact_delay_ms(120); 
+                set_motor_speeds(0, 0);        
+                exact_delay_ms(1500);          
+                
+                // 2. RIGHT TURN
+                set_motor_speeds(pivot_speed, -pivot_speed); 
+                exact_delay_ms(280);
+                while(RB2 == 1); 
+                while(RB2 == 0); 
+                set_motor_speeds(0, 0);
+                exact_delay_ms(200); 
+                previous_error = 0; I = 0; 
+                
+                // 3. FORWARD PID UNTIL ULTRASONIC DETECTS WALL
+                int stop_confidence = 0;
+                int sensor_cooldown = 25; 
+                float dist = 999.0;        
+
+                while(1) {
+                    sensor_cooldown++;
+                    
+                    if (sensor_cooldown > 25) {
+                        dist = get_distance_cm();
+                        sensor_cooldown = 0;
+                    }
+
+                    // SENSING RANGE: 6.0cm
+                    if (dist > 1.0 && dist < 100.0) {
+                        if (dist <= 6.0) stop_confidence++;
+                        else if (dist > 6.5) stop_confidence = 0; 
+                    }
+                    
+                    if (stop_confidence >= 2) {
+                        // IMMEDIATELY BRAKE AND STOP ASAP
+                        set_motor_speeds(-150, -150); 
+                        exact_delay_ms(100);
+                        set_motor_speeds(0, 0);
+                        exact_delay_ms(1000); 
+                        break; // Move to reverse loop
+                    }
+                    
+                    // Keep Line Following Forward
+                    int app_s1 = (RB0 == 1) ? 1 : 0; int app_s2 = (RB1 == 1) ? 1 : 0; 
+                    int app_s3 = (RB2 == 1) ? 1 : 0; int app_s4 = (RB3 == 1) ? 1 : 0; 
+                    int app_s5 = (RB4 == 1) ? 1 : 0;
+                    
+                    int app_err = 0;
+                    if      ( app_s1 && !app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -10;
+                    else if ( app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -6;
+                    else if (!app_s1 &&  app_s2 && !app_s3 && !app_s4 && !app_s5) app_err = -3;
+                    else if (!app_s1 &&  app_s2 &&  app_s3 && !app_s4 && !app_s5) app_err = -1;
+                    else if (!app_s1 && !app_s2 &&  app_s3 &&  app_s4 && !app_s5) app_err =  0;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 && !app_s5) app_err =  3;
+                    else if (!app_s1 && !app_s2 && !app_s3 &&  app_s4 &&  app_s5) app_err =  6;
+                    else if (!app_s1 && !app_s2 && !app_s3 && !app_s4 &&  app_s5) app_err =  10; 
+                    
+                    float app_P = app_err; I += app_err; float app_D = app_err - previous_error;
+                    if (I > 50) I = 50; if (I < -50) I = -50;
+                    float app_PID = (Kp * app_P) + (Ki * I) + (Kd * app_D);
+                    previous_error = app_err;
+
+                    set_motor_speeds(base_speed + (int)app_PID, base_speed - (int)app_PID);
+                    exact_delay_ms(2);
+                }
+                
+                // ==========================================
+                // 4. REVERSE (NO PID) UNTIL J24
+                // ==========================================
+                int rev_junctions = 0;
+                int rev_in_junction = 0;
+                int rev_base_speed = -115; // Slow, controlled reverse speed
+                
+                set_motor_speeds(rev_base_speed, rev_base_speed);
+
+                while(1) {
+                    int app_s1 = (RB0 == 1) ? 1 : 0; int app_s2 = (RB1 == 1) ? 1 : 0; 
+                    int app_s3 = (RB2 == 1) ? 1 : 0; int app_s4 = (RB3 == 1) ? 1 : 0; 
+                    int app_s5 = (RB4 == 1) ? 1 : 0;
+                    
+                    // Detect Junctions in Reverse (Will cross 22, 23, and park on 24)
+                    if (app_s1 && app_s2 && app_s3 && app_s4 && app_s5) {
+                        if (rev_in_junction == 0) {
+                            rev_junctions++;
+                            rev_in_junction = 1;
+                            
+                            // 3rd Junction in reverse is J24
+                            if (rev_junctions == 3) { 
+                                // Reached J24! Stop the car completely.
+                                set_motor_speeds(150, 150); // Hard Forward brake to kill momentum
+                                exact_delay_ms(100);
+                                set_motor_speeds(0, 0);
+                                while(1); // Parked forever!
+                            }
+                        }
+                    } else if (app_s1 == 0 && app_s5 == 0) {
+                        rev_in_junction = 0; // Unlatch
+                    }
+                    
+                    // Keep reversing straight blindly
+                    set_motor_speeds(rev_base_speed, rev_base_speed);
+                    exact_delay_ms(2);
+                }
+            }
+        }
+        
+        // Strict Unlatch Logic 
+        if (in_junction == 1 && s1 == 0 && s5 == 0) {
+            in_junction = 0;
+        }
+
+        // ==========================================
+        // SEARCH & RECOVER (CONFIDENCE FILTER)
+        // ==========================================
+        if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0) {
+            int line_confidence = 0;
+            for (int i = 0; i < 3; i++) {
+                exact_delay_ms(1);
+                if ((RB0==1)||(RB1==1)||(RB2==1)||(RB3==1)||(RB4==1)) line_confidence++;
+            }
+            if (line_confidence < 2) {
+                if (lost_line_flag == 0) {
+                    int recovered = 0;
+                    for (int t = 0; t < 150; t++) {
+                        if ((RB0==1)||(RB1==1)||(RB2==1)||(RB3==1)||(RB4==1)) { recovered = 1; break; }
+                        exact_delay_ms(1);
+                    }
+                    if (recovered) continue;
+                    lost_line_flag = 1;
+                }
+                if (previous_error >= 0) set_motor_speeds(pivot_speed, -pivot_speed);
+                else set_motor_speeds(-pivot_speed, pivot_speed);
+                continue;
+            }
+        }
+
+        // ==========================================
+        // NON-LINEAR PID TRACKING
+        // ==========================================
+        lost_line_flag = 0;
+        if      ( s1 && !s2 && !s3 && !s4 && !s5) error = -10;
+        else if ( s1 &&  s2 && !s3 && !s4 && !s5) error = -6;
+        else if (!s1 &&  s2 && !s3 && !s4 && !s5) error = -3;
+        else if (!s1 &&  s2 &&  s3 && !s4 && !s5) error = -1;
+        else if (!s1 && !s2 &&  s3 && !s4 && !s5) error =  0;
+        else if (!s1 && !s2 &&  s3 &&  s4 && !s5) error =  1;
+        else if (!s1 && !s2 && !s3 &&  s4 && !s5) error =  3;
+        else if (!s1 && !s2 && !s3 &&  s4 &&  s5) error =  6;
+        else if (!s1 && !s2 && !s3 && !s4 &&  s5) error =  10; 
+
+        P = error;
+        I += error; 
+        D = error - previous_error;
+        
+        if (I > 50) I = 50;
+        if (I < -50) I = -50;
+        
+        PID_value = (Kp * P) + (Ki * I) + (Kd * D);
+        previous_error = error;
+        
+        set_motor_speeds(base_speed + (int)PID_value, base_speed - (int)PID_value);
+        exact_delay_ms(2); 
+    }
+}
