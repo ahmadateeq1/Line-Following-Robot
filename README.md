@@ -1,6 +1,6 @@
 NERC'26 Autonomous 4WD Line-Following Robot
 
-This repository contains the firmware, control algorithms, and hardware architecture for a 1.5kg, 4-Wheel-Drive (4WD) autonomous line-following robot. Designed for the 21st National Engineering Robotics Contest (NERC) 2026, this project tackles the high-speed inertia and noise-rejection challenges of navigating a complex, 24-node competition track.
+This repository contains the firmware, control algorithms, and hardware architecture for a 4-Wheel-Drive (4WD) autonomous line-following robot. Designed for the 21st National Engineering Robotics Contest (NERC) 2026, this project tackles the high-speed inertia and noise-rejection challenges of navigating a complex, 24-node competition track.
 
 🚀 System Overview
 
